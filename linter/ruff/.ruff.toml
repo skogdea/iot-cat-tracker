@@ -1,0 +1,14 @@
+# Python Linting Configuration (Equivalent to checkstyle.xml)
+line-length = 120
+target-version = "py311"
+
+[lint]
+# Patterns to check (similar to Java checkstyle TreeWalker modules)
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # isort (Import order - similar to your ImportOrder check)
+    "UP",  # pyupgrade (Upgrade syntax)
+    "B",   # flake8-bugbear (Design issues - similar to Java Coding Guidelines)
+]
+#ignore = ["E501"] # Ignore line length if let Ruff handle wrapping differently
