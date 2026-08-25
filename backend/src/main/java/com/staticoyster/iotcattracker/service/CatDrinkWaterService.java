@@ -17,8 +17,10 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -98,6 +100,10 @@ public class CatDrinkWaterService {
 
     //    receive signal from raspberry pi and save it in mongodb
     public void receiveSignal(CatDrinkWaterSignal signal) {
+        if (signal.getSignalId() != null && raspberryPiRepository.existsById(signal.getSignalId())) {
+            logger.info("Ignoring duplicate raw signal {}", signal.getSignalId());
+            return;
+        }
         CatDrinkWaterSignalModel modelToBeSaved = convertToSignalModel(signal);
         raspberryPiRepository.save(modelToBeSaved);
     }
@@ -125,6 +131,11 @@ public class CatDrinkWaterService {
     //    get signals from Mongodb which haven't been processed
     private List<CatDrinkWaterSignal> getSignals() {
         List<CatDrinkWaterSignalModel> newSignalModels;
+
+        //    Resume from Mongo after restart so already-processed signals are not saved again.
+        if (lastSignalModelProcessed == null) {
+            lastSignalModelProcessed = processedSignalRepository.findTopByOrderByTimeStampDesc();
+        }
 
         //    First time run, there's no signal been processed, retrieve the first signal instead.
         if (lastSignalModelProcessed == null) {
@@ -165,8 +176,13 @@ public class CatDrinkWaterService {
         try {
             List<CatDrinkWaterSignal> sortedSignals = getSignals().stream()
                     .sorted(Comparator.comparing(CatDrinkWaterSignal::getTimeStamp))
+                    .filter(signal -> !processedSignalRepository.existsById(signal.getSignalId()))
                     .toList();
+            if (sortedSignals.isEmpty()) {
+                return;
+            }
 
+            Set<Long> newDrinkingSignalIds = new HashSet<>();
             for (int i = 0; i < sortedSignals.size(); i++) {
                 currentSignal = sortedSignals.get(i);
                 long currentSignalTimeStamp = TimeUnit.MILLISECONDS.toSeconds(currentSignal.getTimeStamp());
@@ -182,11 +198,11 @@ public class CatDrinkWaterService {
                 }
 
                 long duration = currentSignalTimeStamp - previousSignalTimeStamp;
-                processSignalDuration(duration);
+                processSignalDuration(duration, newDrinkingSignalIds);
             }
 
             List<ProcessedSignalModel> processedSignalModels = sortedSignals.stream()
-                    .map(this::convertToProcessedSignalModel)
+                    .map(signal -> toProcessedSignalModel(signal, newDrinkingSignalIds))
                     .toList();
             List<ProcessedSignalModel> processedSignalModelsSaved =
                     processedSignalRepository.saveAll(processedSignalModels);
@@ -200,7 +216,7 @@ public class CatDrinkWaterService {
         }
     }
 
-    private void processSignalDuration(long duration) {
+    private void processSignalDuration(long duration, Set<Long> newDrinkingSignalIds) {
         logger.debug(
                 "Thread {} processes signal duration {}", Thread.currentThread().getName(), duration);
         try {
@@ -219,10 +235,11 @@ public class CatDrinkWaterService {
                     try {
                         ProcessedSignalModel currentSignalModel = convertToProcessedSignalModel(currentSignal);
                         currentSignalModel.setDrunkWater(true);
-                        currentDrunkWaterSignalModel = hasDrunkWaterRepository.save(currentSignalModel);
+                        currentDrunkWaterSignalModel = currentSignalModel;
+                        newDrinkingSignalIds.add(currentSignal.getSignalId());
                         Instant currentDrunkWaterTime = Instant.ofEpochMilli(currentSignalModel.getTimeStamp());
                         logger.info(
-                                "Saving drinking event: {} in processSignalDuration(), its time: {}",
+                                "Recording drinking event: {} in processSignalDuration(), its time: {}",
                                 currentDrunkWaterSignalModel,
                                 formattedTime(currentDrunkWaterTime));
                         if (interval == 60000 || interval == 300000) {
@@ -387,5 +404,14 @@ public class CatDrinkWaterService {
                 .withSignalId(signal.getSignalId())
                 .withTimeStamp(signal.getTimeStamp())
                 .build();
+    }
+
+    private ProcessedSignalModel toProcessedSignalModel(
+            CatDrinkWaterSignal signal, Set<Long> newDrinkingSignalIds) {
+        ProcessedSignalModel model = convertToProcessedSignalModel(signal);
+        if (newDrinkingSignalIds.contains(signal.getSignalId())) {
+            model.setDrunkWater(true);
+        }
+        return model;
     }
 }
