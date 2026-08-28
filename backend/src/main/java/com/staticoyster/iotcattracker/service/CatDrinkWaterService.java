@@ -406,8 +406,7 @@ public class CatDrinkWaterService {
                 .build();
     }
 
-    private ProcessedSignalModel toProcessedSignalModel(
-            CatDrinkWaterSignal signal, Set<Long> newDrinkingSignalIds) {
+    private ProcessedSignalModel toProcessedSignalModel(CatDrinkWaterSignal signal, Set<Long> newDrinkingSignalIds) {
         ProcessedSignalModel model = convertToProcessedSignalModel(signal);
         if (newDrinkingSignalIds.contains(signal.getSignalId())) {
             model.setDrunkWater(true);
