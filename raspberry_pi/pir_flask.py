@@ -5,11 +5,11 @@ import threading
 from datetime import datetime, timezone
 
 import requests
-from config.logging_config import setup_logging
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 from gpiozero import RGBLED, MotionSensor
 
+from config.logging_config import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
