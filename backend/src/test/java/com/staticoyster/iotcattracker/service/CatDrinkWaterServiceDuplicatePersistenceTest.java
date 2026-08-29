@@ -91,6 +91,27 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
     }
 
     @Test
+    public void failedSaveAllDoesNotDropDrunkWaterOnRetry() throws Exception {
+        Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(null);
+        Mockito.when(raspberryPiRepository.findTopByOrderByTimeStampAsc()).thenReturn(firstRawSignal());
+        Mockito.when(raspberryPiRepository.findByTimeStampAfter(0L)).thenReturn(List.of(drinkingRawSignal()));
+        Mockito.when(processedSignalRepository.existsById(DRINKING_SIGNAL_ID)).thenReturn(false);
+        Mockito.when(processedSignalRepository.saveAll(Mockito.anyList()))
+                .thenThrow(new RuntimeException("mongo unavailable"))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        invokeCheckIfCatHasDrunkWater();
+        invokeCheckIfCatHasDrunkWater();
+
+        ArgumentCaptor<List<ProcessedSignalModel>> captor = ArgumentCaptor.forClass(List.class);
+        Mockito.verify(processedSignalRepository, Mockito.times(2)).saveAll(captor.capture());
+        List<ProcessedSignalModel> retriedSave = captor.getAllValues().get(1);
+        Assertions.assertEquals(1, retriedSave.size());
+        Assertions.assertEquals(DRINKING_SIGNAL_ID, retriedSave.get(0).getSignalId());
+        Assertions.assertTrue(retriedSave.get(0).isDrunkWater());
+    }
+
+    @Test
     public void alreadyProcessedSignalsAreNotSavedAgain() throws Exception {
         Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(null);
         Mockito.when(raspberryPiRepository.findTopByOrderByTimeStampAsc()).thenReturn(firstRawSignal());

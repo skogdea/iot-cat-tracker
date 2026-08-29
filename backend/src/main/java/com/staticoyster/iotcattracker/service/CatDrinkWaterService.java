@@ -183,6 +183,8 @@ public class CatDrinkWaterService {
             }
 
             Set<Long> newDrinkingSignalIds = new HashSet<>();
+            // Commit isDrinking only after saveAll so a failed write can still mark drunkWater on retry.
+            boolean drinking = isDrinking;
             for (int i = 0; i < sortedSignals.size(); i++) {
                 currentSignal = sortedSignals.get(i);
                 long currentSignalTimeStamp = TimeUnit.MILLISECONDS.toSeconds(currentSignal.getTimeStamp());
@@ -198,7 +200,7 @@ public class CatDrinkWaterService {
                 }
 
                 long duration = currentSignalTimeStamp - previousSignalTimeStamp;
-                processSignalDuration(duration, newDrinkingSignalIds);
+                drinking = processSignalDuration(duration, newDrinkingSignalIds, drinking);
             }
 
             List<ProcessedSignalModel> processedSignalModels = sortedSignals.stream()
@@ -211,12 +213,13 @@ public class CatDrinkWaterService {
                     processedSignalModelsSaved.size());
 
             lastSignalModelProcessed = processedSignalModelsSaved.get(processedSignalModelsSaved.size() - 1);
+            isDrinking = drinking;
         } catch (Exception exception) {
             logger.warn("Warning or error in checkIfCatHasDrunkWater(): {}", exception.getMessage());
         }
     }
 
-    private void processSignalDuration(long duration, Set<Long> newDrinkingSignalIds) {
+    private boolean processSignalDuration(long duration, Set<Long> newDrinkingSignalIds, boolean drinking) {
         logger.debug(
                 "Thread {} processes signal duration {}", Thread.currentThread().getName(), duration);
         try {
@@ -226,17 +229,17 @@ public class CatDrinkWaterService {
                 logger.info("Your cat might have drunk water.");
                 // It's assumed that cat has drunk water if it stays 10 seconds or longer and less than 5 minutes:
             } else if (duration < 300) {
-                if (!isDrinking) {
-                    isDrinking = true;
-                    logger.debug(
-                            "Thread {} sets isDrinking to true",
-                            Thread.currentThread().getName());
+                if (!drinking) {
                     logger.info("Your \uD83D\uDC08 has drunk water.");
                     try {
                         ProcessedSignalModel currentSignalModel = convertToProcessedSignalModel(currentSignal);
                         currentSignalModel.setDrunkWater(true);
                         currentDrunkWaterSignalModel = currentSignalModel;
                         newDrinkingSignalIds.add(currentSignal.getSignalId());
+                        drinking = true;
+                        logger.debug(
+                                "Thread {} sets isDrinking to true",
+                                Thread.currentThread().getName());
                         Instant currentDrunkWaterTime = Instant.ofEpochMilli(currentSignalModel.getTimeStamp());
                         logger.info(
                                 "Recording drinking event: {} in processSignalDuration(), its time: {}",
@@ -265,7 +268,7 @@ public class CatDrinkWaterService {
             }
             // It's assumed that cat has left long ago if there's been no signal for 5 minutes or longer:
             if (duration >= 300) {
-                isDrinking = false;
+                drinking = false;
                 logger.info(
                         "Thread {} sets isDrinking to false",
                         Thread.currentThread().getName());
@@ -274,6 +277,7 @@ public class CatDrinkWaterService {
         } catch (Exception exception) {
             logger.error("Error in processSignalDuration(): {}", exception.getMessage());
         }
+        return drinking;
     }
 
     private List<CatDrinkWaterSignalModel> retrieveNewSignalModels(long timeStamp) {
