@@ -16,9 +16,11 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -98,6 +100,10 @@ public class CatDrinkWaterService {
 
     //    receive signal from raspberry pi and save it in mongodb
     public void receiveSignal(CatDrinkWaterSignal signal) {
+        if (signal.getSignalId() != null && raspberryPiRepository.existsById(signal.getSignalId())) {
+            logger.info("Ignoring duplicate raw signal {}", signal.getSignalId());
+            return;
+        }
         CatDrinkWaterSignalModel modelToBeSaved = convertToSignalModel(signal);
         raspberryPiRepository.save(modelToBeSaved);
     }
@@ -125,6 +131,14 @@ public class CatDrinkWaterService {
     //    get signals from Mongodb which haven't been processed
     private List<CatDrinkWaterSignal> getSignals() {
         List<CatDrinkWaterSignalModel> newSignalModels;
+
+        //    Resume from Mongo after restart so already-processed signals are not saved again.
+        if (lastSignalModelProcessed == null) {
+            lastSignalModelProcessed = processedSignalRepository.findTopByOrderByTimeStampDesc();
+            if (lastSignalModelProcessed != null) {
+                isDrinking = restoreIsDrinking(lastSignalModelProcessed);
+            }
+        }
 
         //    First time run, there's no signal been processed, retrieve the first signal instead.
         if (lastSignalModelProcessed == null) {
@@ -165,8 +179,15 @@ public class CatDrinkWaterService {
         try {
             List<CatDrinkWaterSignal> sortedSignals = getSignals().stream()
                     .sorted(Comparator.comparing(CatDrinkWaterSignal::getTimeStamp))
+                    .filter(signal -> !processedSignalRepository.existsById(signal.getSignalId()))
                     .toList();
+            if (sortedSignals.isEmpty()) {
+                return;
+            }
 
+            List<ProcessedSignalModel> newDrinkingEvents = new ArrayList<>();
+            // Commit isDrinking only after saveAll so a failed write can still mark drunkWater on retry.
+            boolean drinking = isDrinking;
             for (int i = 0; i < sortedSignals.size(); i++) {
                 currentSignal = sortedSignals.get(i);
                 long currentSignalTimeStamp = TimeUnit.MILLISECONDS.toSeconds(currentSignal.getTimeStamp());
@@ -182,11 +203,14 @@ public class CatDrinkWaterService {
                 }
 
                 long duration = currentSignalTimeStamp - previousSignalTimeStamp;
-                processSignalDuration(duration);
+                drinking = processSignalDuration(duration, newDrinkingEvents, drinking);
             }
 
+            Set<Long> newDrinkingSignalIds = newDrinkingEvents.stream()
+                    .map(ProcessedSignalModel::getSignalId)
+                    .collect(Collectors.toSet());
             List<ProcessedSignalModel> processedSignalModels = sortedSignals.stream()
-                    .map(this::convertToProcessedSignalModel)
+                    .map(signal -> toProcessedSignalModel(signal, newDrinkingSignalIds))
                     .toList();
             List<ProcessedSignalModel> processedSignalModelsSaved =
                     processedSignalRepository.saveAll(processedSignalModels);
@@ -195,12 +219,15 @@ public class CatDrinkWaterService {
                     processedSignalModelsSaved.size());
 
             lastSignalModelProcessed = processedSignalModelsSaved.get(processedSignalModelsSaved.size() - 1);
+            isDrinking = drinking;
+            notifyNewDrinkingEvents(newDrinkingEvents);
         } catch (Exception exception) {
             logger.warn("Warning or error in checkIfCatHasDrunkWater(): {}", exception.getMessage());
         }
     }
 
-    private void processSignalDuration(long duration) {
+    private boolean processSignalDuration(
+            long duration, List<ProcessedSignalModel> newDrinkingEvents, boolean drinking) {
         logger.debug(
                 "Thread {} processes signal duration {}", Thread.currentThread().getName(), duration);
         try {
@@ -210,45 +237,26 @@ public class CatDrinkWaterService {
                 logger.info("Your cat might have drunk water.");
                 // It's assumed that cat has drunk water if it stays 10 seconds or longer and less than 5 minutes:
             } else if (duration < 300) {
-                if (!isDrinking) {
-                    isDrinking = true;
+                if (!drinking) {
+                    logger.info("Your \uD83D\uDC08 has drunk water.");
+                    ProcessedSignalModel currentSignalModel = convertToProcessedSignalModel(currentSignal);
+                    currentSignalModel.setDrunkWater(true);
+                    currentDrunkWaterSignalModel = currentSignalModel;
+                    newDrinkingEvents.add(currentSignalModel);
+                    drinking = true;
                     logger.debug(
                             "Thread {} sets isDrinking to true",
                             Thread.currentThread().getName());
-                    logger.info("Your \uD83D\uDC08 has drunk water.");
-                    try {
-                        ProcessedSignalModel currentSignalModel = convertToProcessedSignalModel(currentSignal);
-                        currentSignalModel.setDrunkWater(true);
-                        currentDrunkWaterSignalModel = hasDrunkWaterRepository.save(currentSignalModel);
-                        Instant currentDrunkWaterTime = Instant.ofEpochMilli(currentSignalModel.getTimeStamp());
-                        logger.info(
-                                "Saving drinking event: {} in processSignalDuration(), its time: {}",
-                                currentDrunkWaterSignalModel,
-                                formattedTime(currentDrunkWaterTime));
-                        if (interval == 60000 || interval == 300000) {
-                            sendEmail();
-                        } else if (interval == 3600000 || interval == 86400000) {
-                            scheduler.scheduleAtFixedRate(
-                                    () -> {
-                                        if (hasSentReport.compareAndSet(false, true)) {
-                                            sendEmail();
-                                            scheduler.scheduleAtFixedRate(
-                                                    () -> hasSentReport.set(false), 0, interval, TimeUnit.MILLISECONDS);
-                                        }
-                                    },
-                                    0,
-                                    interval,
-                                    TimeUnit.MILLISECONDS);
-                            logger.info("It's scheduled to sendEmail and reset hasSentReport.");
-                        }
-                    } catch (Exception exception) {
-                        logger.error("Failed to send notification or summary report: {}", exception.getMessage());
-                    }
+                    Instant currentDrunkWaterTime = Instant.ofEpochMilli(currentSignalModel.getTimeStamp());
+                    logger.info(
+                            "Recording drinking event: {} in processSignalDuration(), its time: {}",
+                            currentDrunkWaterSignalModel,
+                            formattedTime(currentDrunkWaterTime));
                 }
             }
             // It's assumed that cat has left long ago if there's been no signal for 5 minutes or longer:
             if (duration >= 300) {
-                isDrinking = false;
+                drinking = false;
                 logger.info(
                         "Thread {} sets isDrinking to false",
                         Thread.currentThread().getName());
@@ -256,6 +264,56 @@ public class CatDrinkWaterService {
             }
         } catch (Exception exception) {
             logger.error("Error in processSignalDuration(): {}", exception.getMessage());
+        }
+        return drinking;
+    }
+
+    private boolean restoreIsDrinking(ProcessedSignalModel lastProcessed) {
+        if (lastProcessed.isDrunkWater()) {
+            return true;
+        }
+        ProcessedSignalModel lastDrink = processedSignalRepository.findTopByDrunkWaterTrueOrderByTimeStampDesc();
+        if (lastDrink == null || lastDrink.getTimeStamp() > lastProcessed.getTimeStamp()) {
+            return false;
+        }
+        List<ProcessedSignalModel> visitSignals = processedSignalRepository.findByTimeStampBetweenOrderByTimeStampAsc(
+                lastDrink.getTimeStamp(), lastProcessed.getTimeStamp());
+        if (visitSignals.isEmpty()) {
+            return false;
+        }
+        for (int i = 1; i < visitSignals.size(); i++) {
+            long duration = TimeUnit.MILLISECONDS.toSeconds(visitSignals.get(i).getTimeStamp())
+                    - TimeUnit.MILLISECONDS.toSeconds(visitSignals.get(i - 1).getTimeStamp());
+            if (duration >= 300) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void notifyNewDrinkingEvents(List<ProcessedSignalModel> newDrinkingEvents) {
+        for (ProcessedSignalModel event : newDrinkingEvents) {
+            currentDrunkWaterSignalModel = event;
+            try {
+                if (interval == 60000 || interval == 300000) {
+                    sendEmail();
+                } else if (interval == 3600000 || interval == 86400000) {
+                    scheduler.scheduleAtFixedRate(
+                            () -> {
+                                if (hasSentReport.compareAndSet(false, true)) {
+                                    sendEmail();
+                                    scheduler.scheduleAtFixedRate(
+                                            () -> hasSentReport.set(false), 0, interval, TimeUnit.MILLISECONDS);
+                                }
+                            },
+                            0,
+                            interval,
+                            TimeUnit.MILLISECONDS);
+                    logger.info("It's scheduled to sendEmail and reset hasSentReport.");
+                }
+            } catch (Exception exception) {
+                logger.error("Failed to send notification or summary report: {}", exception.getMessage());
+            }
         }
     }
 
@@ -387,5 +445,13 @@ public class CatDrinkWaterService {
                 .withSignalId(signal.getSignalId())
                 .withTimeStamp(signal.getTimeStamp())
                 .build();
+    }
+
+    private ProcessedSignalModel toProcessedSignalModel(CatDrinkWaterSignal signal, Set<Long> newDrinkingSignalIds) {
+        ProcessedSignalModel model = convertToProcessedSignalModel(signal);
+        if (newDrinkingSignalIds.contains(signal.getSignalId())) {
+            model.setDrunkWater(true);
+        }
+        return model;
     }
 }

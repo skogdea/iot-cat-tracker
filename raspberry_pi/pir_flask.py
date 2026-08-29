@@ -1,15 +1,15 @@
-import os
-from dotenv import load_dotenv
-from gpiozero import RGBLED, MotionSensor
-from datetime import datetime
-import requests
-import random
-from flask import Flask, jsonify
 import logging
+import os
+import random
 import threading
+from datetime import datetime, timezone
+
+import requests
+from dotenv import load_dotenv
+from flask import Flask, jsonify
+from gpiozero import RGBLED, MotionSensor
 
 from config.logging_config import setup_logging
-
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ def send_signal_to_server():
         "signal_id": random.randint(1, 9223372036854775807),
         "sensor_id": "1",
         "location": "bedroom",
-        "timestamp": int(datetime.now().timestamp() * 1000),
+        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
     }
 
     try:
@@ -61,13 +61,13 @@ def send_signal_to_server():
 
     except requests.exceptions.Timeout:
         logger.warning("Request timeout, server didn't respond.")
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         logger.error(f"Error occurred while sending signal to server: {e}")
 
 
 def motion_detected():
     rgb.color = (1, 0, 0)  # Red
-    timestamp = datetime.now().isoformat(timespec="milliseconds") + "Z"
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     logger.info(f"Motion detected at: {timestamp}!")
     send_signal_to_server()
 

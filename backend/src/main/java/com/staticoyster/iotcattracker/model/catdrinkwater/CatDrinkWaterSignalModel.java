@@ -1,7 +1,7 @@
 package com.staticoyster.iotcattracker.model.catdrinkwater;
 
-import jakarta.persistence.Id;
 import java.util.Objects;
+import org.springframework.data.annotation.Id;
 import org.springframework.data.mongodb.core.mapping.Document;
 
 @Document
