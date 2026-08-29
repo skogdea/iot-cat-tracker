@@ -8,6 +8,7 @@ import com.staticoyster.iotcattracker.model.catdrinkwater.ProcessedSignalModel;
 import com.staticoyster.iotcattracker.mongo.HasDrunkWaterRepository;
 import com.staticoyster.iotcattracker.mongo.ProcessedSignalRepository;
 import com.staticoyster.iotcattracker.mongo.RaspberryPiRepository;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -26,6 +27,9 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
 
     private static final long FIRST_SIGNAL_ID = 1L;
     private static final long DRINKING_SIGNAL_ID = 4972210839327032968L;
+    private static final long FOLLOW_UP_SIGNAL_ID = 2L;
+    private static final long NEXT_SIGNAL_ID = 3L;
+    private static final long MINUTE_INTERVAL = 60_000L;
 
     @Mock
     private RaspberryPiRepository raspberryPiRepository;
@@ -73,6 +77,7 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
 
     @Test
     public void processingADrinkingVisitSavesEachSignalOnceWithDrunkWaterPreserved() throws Exception {
+        setInterval(MINUTE_INTERVAL);
         Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(null);
         Mockito.when(raspberryPiRepository.findTopByOrderByTimeStampAsc()).thenReturn(firstRawSignal());
         Mockito.when(raspberryPiRepository.findByTimeStampAfter(0L)).thenReturn(List.of(drinkingRawSignal()));
@@ -88,10 +93,13 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
         Assertions.assertTrue(saved.get(0).isDrunkWater());
         Mockito.verify(hasDrunkWaterRepository, Mockito.never()).save(Mockito.any());
         Mockito.verify(processedSignalRepository, Mockito.times(1)).saveAll(Mockito.anyList());
+        Mockito.verify(emailClient, Mockito.times(1))
+                .sendEmail(Mockito.eq("recipient@example.com"), Mockito.eq("sender@example.com"), Mockito.any());
     }
 
     @Test
     public void failedSaveAllDoesNotDropDrunkWaterOnRetry() throws Exception {
+        setInterval(MINUTE_INTERVAL);
         Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(null);
         Mockito.when(raspberryPiRepository.findTopByOrderByTimeStampAsc()).thenReturn(firstRawSignal());
         Mockito.when(raspberryPiRepository.findByTimeStampAfter(0L)).thenReturn(List.of(drinkingRawSignal()));
@@ -109,10 +117,13 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
         Assertions.assertEquals(1, retriedSave.size());
         Assertions.assertEquals(DRINKING_SIGNAL_ID, retriedSave.get(0).getSignalId());
         Assertions.assertTrue(retriedSave.get(0).isDrunkWater());
+        Mockito.verify(emailClient, Mockito.times(1))
+                .sendEmail(Mockito.eq("recipient@example.com"), Mockito.eq("sender@example.com"), Mockito.any());
     }
 
     @Test
     public void alreadyProcessedSignalsAreNotSavedAgain() throws Exception {
+        setInterval(MINUTE_INTERVAL);
         Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(null);
         Mockito.when(raspberryPiRepository.findTopByOrderByTimeStampAsc()).thenReturn(firstRawSignal());
         Mockito.when(raspberryPiRepository.findByTimeStampAfter(Mockito.anyLong()))
@@ -128,6 +139,77 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
 
         Mockito.verify(processedSignalRepository, Mockito.times(1)).saveAll(Mockito.anyList());
         Mockito.verify(hasDrunkWaterRepository, Mockito.never()).save(Mockito.any());
+        Mockito.verify(emailClient, Mockito.times(1))
+                .sendEmail(Mockito.eq("recipient@example.com"), Mockito.eq("sender@example.com"), Mockito.any());
+    }
+
+    @Test
+    public void resumeDoesNotTreatAContinuingDrinkingVisitAsNew() throws Exception {
+        setInterval(MINUTE_INTERVAL);
+        ProcessedSignalModel lastDrink = processed(DRINKING_SIGNAL_ID, seconds(15), true);
+        Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(lastDrink);
+        Mockito.when(raspberryPiRepository.findByTimeStampAfter(seconds(15)))
+                .thenReturn(List.of(rawModel(NEXT_SIGNAL_ID, seconds(30))));
+        Mockito.when(processedSignalRepository.existsById(NEXT_SIGNAL_ID)).thenReturn(false);
+        Mockito.when(processedSignalRepository.saveAll(Mockito.anyList()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        invokeCheckIfCatHasDrunkWater();
+
+        List<ProcessedSignalModel> saved = savedProcessedSignals();
+        Assertions.assertEquals(1, saved.size());
+        Assertions.assertEquals(NEXT_SIGNAL_ID, saved.get(0).getSignalId());
+        Assertions.assertFalse(saved.get(0).isDrunkWater());
+        Mockito.verify(emailClient, Mockito.never()).sendEmail(Mockito.any(), Mockito.any(), Mockito.any());
+    }
+
+    @Test
+    public void resumeDoesNotTreatFollowUpSignalsInTheSameVisitAsNew() throws Exception {
+        setInterval(MINUTE_INTERVAL);
+        ProcessedSignalModel lastDrink = processed(DRINKING_SIGNAL_ID, seconds(15), true);
+        ProcessedSignalModel lastFollowUp = processed(FOLLOW_UP_SIGNAL_ID, seconds(20), false);
+        Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(lastFollowUp);
+        Mockito.when(processedSignalRepository.findTopByDrunkWaterTrueOrderByTimeStampDesc())
+                .thenReturn(lastDrink);
+        Mockito.when(processedSignalRepository.findByTimeStampBetweenOrderByTimeStampAsc(seconds(15), seconds(20)))
+                .thenReturn(List.of(lastDrink, lastFollowUp));
+        Mockito.when(raspberryPiRepository.findByTimeStampAfter(seconds(20)))
+                .thenReturn(List.of(rawModel(NEXT_SIGNAL_ID, seconds(40))));
+        Mockito.when(processedSignalRepository.existsById(NEXT_SIGNAL_ID)).thenReturn(false);
+        Mockito.when(processedSignalRepository.saveAll(Mockito.anyList()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        invokeCheckIfCatHasDrunkWater();
+
+        List<ProcessedSignalModel> saved = savedProcessedSignals();
+        Assertions.assertEquals(1, saved.size());
+        Assertions.assertFalse(saved.get(0).isDrunkWater());
+        Mockito.verify(emailClient, Mockito.never()).sendEmail(Mockito.any(), Mockito.any(), Mockito.any());
+    }
+
+    @Test
+    public void resumeStillDetectsANewVisitAfterTheCatHasLeft() throws Exception {
+        setInterval(MINUTE_INTERVAL);
+        ProcessedSignalModel lastDrink = processed(DRINKING_SIGNAL_ID, seconds(15), true);
+        ProcessedSignalModel lastAfterLeave = processed(FOLLOW_UP_SIGNAL_ID, seconds(400), false);
+        Mockito.when(processedSignalRepository.findTopByOrderByTimeStampDesc()).thenReturn(lastAfterLeave);
+        Mockito.when(processedSignalRepository.findTopByDrunkWaterTrueOrderByTimeStampDesc())
+                .thenReturn(lastDrink);
+        Mockito.when(processedSignalRepository.findByTimeStampBetweenOrderByTimeStampAsc(seconds(15), seconds(400)))
+                .thenReturn(List.of(lastDrink, lastAfterLeave));
+        Mockito.when(raspberryPiRepository.findByTimeStampAfter(seconds(400)))
+                .thenReturn(List.of(rawModel(NEXT_SIGNAL_ID, seconds(415))));
+        Mockito.when(processedSignalRepository.existsById(NEXT_SIGNAL_ID)).thenReturn(false);
+        Mockito.when(processedSignalRepository.saveAll(Mockito.anyList()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        invokeCheckIfCatHasDrunkWater();
+
+        List<ProcessedSignalModel> saved = savedProcessedSignals();
+        Assertions.assertEquals(1, saved.size());
+        Assertions.assertTrue(saved.get(0).isDrunkWater());
+        Mockito.verify(emailClient, Mockito.times(1))
+                .sendEmail(Mockito.eq("recipient@example.com"), Mockito.eq("sender@example.com"), Mockito.any());
     }
 
     @SuppressWarnings("unchecked")
@@ -143,6 +225,12 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
         method.invoke(service);
     }
 
+    private void setInterval(long millis) throws Exception {
+        Field field = CatDrinkWaterService.class.getDeclaredField("interval");
+        field.setAccessible(true);
+        field.setLong(service, millis);
+    }
+
     private static CatDrinkWaterSignal rawSignal(long signalId, long timeStamp) {
         return ImmutableCatDrinkWaterSignal.builder()
                 .signalId(signalId)
@@ -153,20 +241,27 @@ public class CatDrinkWaterServiceDuplicatePersistenceTest {
     }
 
     private static CatDrinkWaterSignalModel firstRawSignal() {
-        return CatDrinkWaterSignalModel.Builder.newBuilder()
-                .withSignalId(FIRST_SIGNAL_ID)
-                .withSensorId("1")
-                .withLocation("bedroom")
-                .withTimeStamp(0L)
-                .build();
+        return rawModel(FIRST_SIGNAL_ID, 0L);
     }
 
     private static CatDrinkWaterSignalModel drinkingRawSignal() {
+        return rawModel(DRINKING_SIGNAL_ID, seconds(15));
+    }
+
+    private static CatDrinkWaterSignalModel rawModel(long signalId, long timeStamp) {
         return CatDrinkWaterSignalModel.Builder.newBuilder()
-                .withSignalId(DRINKING_SIGNAL_ID)
+                .withSignalId(signalId)
                 .withSensorId("1")
                 .withLocation("bedroom")
-                .withTimeStamp(seconds(15))
+                .withTimeStamp(timeStamp)
+                .build();
+    }
+
+    private static ProcessedSignalModel processed(long signalId, long timeStamp, boolean drunkWater) {
+        return ProcessedSignalModel.Builder.newBuilder()
+                .withSignalId(signalId)
+                .withTimeStamp(timeStamp)
+                .withDrunkWater(drunkWater)
                 .build();
     }
 
